@@ -211,6 +211,29 @@ export class HashClient {
     return this.romInitialized;
   }
 
+  /**
+   * Kill all worker threads in the hash service
+   * Call this when a new challenge comes in to stop workers processing old challenge
+   */
+  async killWorkers(): Promise<void> {
+    try {
+      console.log('[HashClient] Sending kill-workers request to hash service...');
+      const response = await this.axiosInstance.post('/kill-workers', {}, {
+        timeout: 5000,
+        httpAgent: new http.Agent({ keepAlive: false }),
+        headers: { 'Connection': 'close' }
+      });
+      console.log(`[HashClient] ✓ Workers killed: ${response.data.message || 'Success'}`);
+    } catch (err: any) {
+      // Don't throw error if endpoint doesn't exist yet (backwards compatibility)
+      if (err.response?.status === 404) {
+        console.log('[HashClient] Kill-workers endpoint not available (older hash service version)');
+      } else {
+        console.error(`[HashClient] Failed to kill workers: ${err.message}`);
+      }
+    }
+  }
+
   destroy(): void {
     this.keepAliveAgent.destroy();
   }

@@ -164,6 +164,18 @@ class HashEngine {
   }
 
   /**
+   * Kill all worker threads in the hash service
+   * Call this when a new challenge comes in to stop workers processing old challenge
+   */
+  async killWorkers(): Promise<void> {
+    if (!this.hashClient) {
+      console.log('[Hash Engine] No hash client available to kill workers');
+      return;
+    }
+    await this.hashClient.killWorkers();
+  }
+
+  /**
    * Get engine status
    */
   async getStatus(): Promise<HashEngineStatus> {

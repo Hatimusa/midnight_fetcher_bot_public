@@ -12,7 +12,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    await miningOrchestrator.start(password);
+    // Use reinitialize to ensure fresh state when start button is clicked
+    console.log('[API] Start button clicked - reinitializing orchestrator...');
+    await miningOrchestrator.reinitialize(password);
 
     return NextResponse.json({
       success: true,

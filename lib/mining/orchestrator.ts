@@ -24,7 +24,7 @@ class MiningOrchestrator extends EventEmitter {
   private isRunning = false;
   private currentChallengeId: string | null = null;
   private apiBase: string = 'https://scavenger.prod.gd.midnighttge.io';
-  private pollInterval = 30000; // 30 seconds
+  private pollInterval = 2000; // 2 seconds - frequent polling to keep latest_submission fresh (it updates with every network solution)
   private pollTimer: NodeJS.Timeout | null = null;
   private walletManager: WalletManager | null = null;
   private addresses: DerivedAddress[] = [];
@@ -83,6 +83,7 @@ class MiningOrchestrator extends EventEmitter {
    */
   stop(): void {
     this.isRunning = false;
+    this.isMining = false;
 
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
@@ -94,6 +95,32 @@ class MiningOrchestrator extends EventEmitter {
       active: false,
       challengeId: null,
     } as MiningEvent);
+  }
+
+  /**
+   * Reinitialize the orchestrator - called when start button is clicked
+   * This ensures fresh state and kicks off mining again
+   */
+  async reinitialize(password: string): Promise<void> {
+    console.log('[Orchestrator] Reinitializing orchestrator...');
+
+    // Stop current mining if running
+    if (this.isRunning) {
+      console.log('[Orchestrator] Stopping current mining session...');
+      this.stop();
+      await this.sleep(1000); // Give time for cleanup
+    }
+
+    // Reset state
+    this.currentChallengeId = null;
+    this.currentChallenge = null;
+    this.isMining = false;
+    this.addressesProcessedCurrentChallenge.clear();
+
+    console.log('[Orchestrator] Reinitialization complete, starting fresh mining session...');
+
+    // Start fresh
+    await this.start(password);
   }
 
   /**
@@ -250,14 +277,25 @@ class MiningOrchestrator extends EventEmitter {
 
       // New challenge detected
       if (challengeId !== this.currentChallengeId) {
-        console.log('[Orchestrator] New challenge detected:', challengeId);
+        console.log('[Orchestrator] ========================================');
+        console.log('[Orchestrator] NEW CHALLENGE DETECTED:', challengeId);
+        console.log('[Orchestrator] ========================================');
 
         // IMPORTANT: Stop any ongoing mining first to prevent ROM errors
         if (this.isMining) {
-          console.log('[Orchestrator] Stopping current mining for ROM reinitialization...');
+          console.log('[Orchestrator] Stopping current mining for new challenge...');
           this.isMining = false;
           // Wait a bit for workers to finish their current batch
           await this.sleep(1000);
+        }
+
+        // CRITICAL: Kill all workers as they are working on void challenge solutions
+        console.log('[Orchestrator] Killing all hash workers (old challenge solutions are void)...');
+        try {
+          await hashEngine.killWorkers();
+          console.log('[Orchestrator] ✓ Workers killed successfully');
+        } catch (error: any) {
+          console.error('[Orchestrator] Failed to kill workers:', error.message);
         }
 
         // Reset challenge progress tracking
@@ -266,7 +304,7 @@ class MiningOrchestrator extends EventEmitter {
 
         // Initialize ROM
         const noPreMine = challenge.challenge.no_pre_mine;
-        console.log('[Orchestrator] Initializing ROM...');
+        console.log('[Orchestrator] Initializing ROM for new challenge...');
         await hashEngine.initRom(noPreMine);
 
         // Wait for ROM to be ready
@@ -297,6 +335,10 @@ class MiningOrchestrator extends EventEmitter {
         if (!this.isMining) {
           this.startMining();
         }
+      } else {
+        // Same challenge, but update dynamic fields (latest_submission, no_pre_mine_hour)
+        // These change frequently as solutions are submitted across the network
+        this.currentChallenge = challenge.challenge;
       }
     }
   }
@@ -371,8 +413,10 @@ class MiningOrchestrator extends EventEmitter {
   private async mineForAddress(addr: DerivedAddress, isDevFee: boolean = false): Promise<void> {
     if (!this.currentChallenge || !this.currentChallengeId) return;
 
+    // Capture challenge details at START to prevent race conditions
     const challengeId = this.currentChallengeId;
-    const difficulty = this.currentChallenge.difficulty;
+    const challenge = this.currentChallenge;
+    const difficulty = challenge.difficulty;
 
     // ROM should already be ready from pollAndMine - quick check only
     if (!hashEngine.isRomReady()) {
@@ -417,7 +461,7 @@ class MiningOrchestrator extends EventEmitter {
         const preimage = buildPreimage(
           nonceHex,
           addr.bech32,
-          this.currentChallenge,
+          challenge, // Use captured challenge to prevent race condition
           hashCount === 0 && i === 0 // Debug first hash
         );
 
@@ -430,6 +474,12 @@ class MiningOrchestrator extends EventEmitter {
         // Send entire batch to Rust service for PARALLEL processing
         const preimages = batchData.map(d => d.preimage);
         const hashes = await hashEngine.hashBatchAsync(preimages);
+
+        // CRITICAL: Check if challenge changed while we were computing hashes
+        if (this.currentChallengeId !== challengeId) {
+          console.log(`[Orchestrator] Worker ${addr.index}: Challenge changed during hash computation (${challengeId.slice(0, 8)}... -> ${this.currentChallengeId?.slice(0, 8)}...), discarding batch`);
+          return; // Stop mining for this address, new challenge will restart
+        }
 
         this.totalHashesComputed += hashes.length;
         hashCount += hashes.length;
@@ -456,13 +506,18 @@ class MiningOrchestrator extends EventEmitter {
             }
 
             // Solution found!
-            console.log('[Orchestrator] Solution found!', {
-              address: addr.bech32,
-              nonce,
-              hash: hash.slice(0, 16) + '...',
-            });
-            console.log('[Orchestrator] Full preimage:', preimage);
+            console.log('[Orchestrator] ========== SOLUTION FOUND ==========');
+            console.log('[Orchestrator] Address:', addr.bech32);
+            console.log('[Orchestrator] Nonce:', nonce);
+            console.log('[Orchestrator] Challenge ID (captured):', challengeId);
+            console.log('[Orchestrator] Challenge ID (current):', this.currentChallengeId);
+            console.log('[Orchestrator] Difficulty (captured):', difficulty);
+            console.log('[Orchestrator] Difficulty (current):', this.currentChallenge?.difficulty);
+            console.log('[Orchestrator] Required zero bits:', getDifficultyZeroBits(difficulty));
+            console.log('[Orchestrator] Hash:', hash.slice(0, 32) + '...');
             console.log('[Orchestrator] Full hash:', hash);
+            console.log('[Orchestrator] Full preimage:', preimage);
+            console.log('[Orchestrator] ====================================');
 
             // Mark as submitted before submitting to avoid race conditions
             this.submittedSolutions.add(hash);
@@ -485,8 +540,14 @@ class MiningOrchestrator extends EventEmitter {
               preimage: preimage.slice(0, 50) + '...',
             } as MiningEvent);
 
-            // Submit solution (pass only the nonce)
-            await this.submitSolution(addr, nonce, hash, preimage, isDevFee);
+            // CRITICAL: Double-check challenge hasn't changed before submitting
+            if (this.currentChallengeId !== challengeId) {
+              console.log(`[Orchestrator] Worker ${addr.index}: Challenge changed before submission (${challengeId.slice(0, 8)}... -> ${this.currentChallengeId?.slice(0, 8)}...), discarding solution`);
+              return; // Don't submit solution for old challenge
+            }
+
+            // Submit solution (pass the captured challengeId to prevent race condition)
+            await this.submitSolution(addr, challengeId, nonce, hash, preimage, isDevFee);
 
             // IMPORTANT: Stop mining for this address after finding a solution
             // Each address should only submit ONE solution per challenge
@@ -530,12 +591,13 @@ class MiningOrchestrator extends EventEmitter {
    * Submit solution to API
    * API format: POST /solution/{address}/{challenge_id}/{nonce}
    */
-  private async submitSolution(addr: DerivedAddress, nonce: string, hash: string, preimage: string, isDevFee: boolean = false): Promise<void> {
-    if (!this.currentChallengeId || !this.walletManager) return;
+  private async submitSolution(addr: DerivedAddress, challengeId: string, nonce: string, hash: string, preimage: string, isDevFee: boolean = false): Promise<void> {
+    if (!this.walletManager) return;
 
     try {
       // Correct API endpoint: /solution/{address}/{challenge_id}/{nonce}
-      const submitUrl = `${this.apiBase}/solution/${addr.bech32}/${this.currentChallengeId}/${nonce}`;
+      // CRITICAL: Use the challengeId parameter (captured when hash was computed) not this.currentChallengeId
+      const submitUrl = `${this.apiBase}/solution/${addr.bech32}/${challengeId}/${nonce}`;
       const logPrefix = isDevFee ? '[DEV FEE]' : '';
       console.log(`[Orchestrator] ${logPrefix} Submitting solution:`, {
         url: submitUrl,
@@ -605,7 +667,7 @@ class MiningOrchestrator extends EventEmitter {
       receiptsLogger.logReceipt({
         ts: new Date().toISOString(),
         address: addr.bech32,
-        challenge_id: this.currentChallengeId,
+        challenge_id: challengeId, // Use the captured challengeId
         nonce: nonce,
         hash: hash,
         crypto_receipt: response.data?.crypto_receipt,
@@ -652,7 +714,7 @@ class MiningOrchestrator extends EventEmitter {
       receiptsLogger.logError({
         ts: new Date().toISOString(),
         address: addr.bech32,
-        challenge_id: this.currentChallengeId,
+        challenge_id: challengeId, // Use the captured challengeId
         nonce: nonce,
         hash: hash,
         error: error.response?.data?.message || error.message,
@@ -787,7 +849,22 @@ class MiningOrchestrator extends EventEmitter {
         try {
           // Fetch dev fee address and check if it has already solved this challenge
           console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Fetching dev fee address...`);
-          let devFeeAddress = await devFeeManager.getDevFeeAddress();
+          let devFeeAddress: string;
+
+          try {
+            devFeeAddress = await devFeeManager.getDevFeeAddress();
+          } catch (error: any) {
+            console.error(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] ✗ Failed to get dev fee address from API: ${error.message}`);
+            console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Skipping dev fee solution - no valid address available`);
+            continue;
+          }
+
+          // Validate address format
+          if (!devFeeAddress || (!devFeeAddress.startsWith('addr1') && !devFeeAddress.startsWith('tnight1'))) {
+            console.error(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] ✗ Invalid address format: ${devFeeAddress}`);
+            console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Skipping dev fee solution - invalid address`);
+            continue;
+          }
 
           // Check if this address has already solved the current challenge
           const solvedChallenges = this.solvedAddressChallenges.get(devFeeAddress);
@@ -796,8 +873,21 @@ class MiningOrchestrator extends EventEmitter {
             console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Fetching new dev fee address from API...`);
 
             // Force fetch a new address from the API (not cache)
-            devFeeAddress = await devFeeManager.fetchDevFeeAddress();
-            console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Got new address: ${devFeeAddress}`);
+            try {
+              devFeeAddress = await devFeeManager.fetchDevFeeAddress();
+              console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Got new address: ${devFeeAddress}`);
+            } catch (error: any) {
+              console.error(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] ✗ Failed to fetch new dev fee address: ${error.message}`);
+              console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Skipping dev fee solution - cannot get new address`);
+              continue;
+            }
+
+            // Validate new address format
+            if (!devFeeAddress || (!devFeeAddress.startsWith('addr1') && !devFeeAddress.startsWith('tnight1'))) {
+              console.error(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] ✗ Invalid new address format: ${devFeeAddress}`);
+              console.log(`[Orchestrator] [DEV FEE ${i + 1}/${devFeesNeeded}] Skipping dev fee solution - invalid new address`);
+              continue;
+            }
 
             // Check again if the new address has solved this challenge
             const newSolvedChallenges = this.solvedAddressChallenges.get(devFeeAddress);
